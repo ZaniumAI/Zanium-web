@@ -368,91 +368,111 @@ const Chat = ({ isSidebarOpen }) => {
         inputText ||
         "Write a detailed summary of non clinical plan of care from the information provided here in the text. Include all the necessary steps to ensure patient care in terms of diet, exercise, therapy, counseling etc";
     }
-
     formData.append("prompt", prompt);
 
     try {
       setUploading(true);
 
+      console.log("Sending merge request...");
       const mergeResponse = await fetch(
-        "https://dev.patientime.ai/repair_and_merge_pdfs",
+        "http://13.60.187.155:7865/repair_and_merge_pdfs",
         {
           method: "POST",
           body: formData,
         }
       );
 
-      if (mergeResponse.ok) {
-        const mergedPdfBlob = await mergeResponse.blob();
-
-        const rewriteFormData = new FormData();
-        rewriteFormData.append("pdf_file", mergedPdfBlob, "merged_summary.pdf");
-        rewriteFormData.append("prompt", prompt);
-
-        const rewriteResponse = await fetch(
-          "https://dev.patientime.ai/rewrite_pdf",
-          {
-            method: "POST",
-            body: rewriteFormData,
-          }
-        );
-
-        if (rewriteResponse.ok) {
-          const jsonResponse = await rewriteResponse.json();
-          console.log(jsonResponse);
-
-          // Get the rewritten_pdf field (which is a stringified JSON)
-          const rewrittenPdfString = jsonResponse.rewritten_pdf;
-
-          // Clean the string by removing the json code block markers, including any extra spaces or newlines
-          let cleanedString = rewrittenPdfString
-            .replace(/^```json\s*\n/, "")
-            .replace(/\n```$/, "");
-
-          // Optional: Log the cleaned string before continuing to see if the cleaning works correctly
-          console.log(cleanedString);
-
-          // Parse the cleaned string
-          const parsedJson = JSON.parse(cleanedString);
-
-          console.log(parsedJson);
-          const rewrittenTextFromApi = parsedJson;
-          setRewrittenText(rewrittenTextFromApi);
-
-          const uploadId = uuidv4();
-          const fileUrls = [];
-          for (const file of selectedFiles) {
-            const storageRef = ref(
-              storage,
-              `uploads/${uploadId}/${file.name}/${selectedButton}`
-            );
-            const uploadResult = await uploadBytes(storageRef, file);
-            const downloadUrl = await getDownloadURL(uploadResult.ref);
-            fileUrls.push({
-              url: downloadUrl,
-              fileName: file.name,
-            });
-          }
-          const mrn = generateMRN();
-          const docRef = doc(db, `uploads/${uploadId}`);
-          await setDoc(docRef, {
-            email: user.email,
-            summaryType: selectedButton,
-            uploadedAt: new Date(),
-            rewrittenText: rewrittenTextFromApi,
-            fileUrls,
-            mrn,
-          });
-
-          console.log("Data successfully saved to Firestore");
-        } else {
-          console.error("Error from rewrite_pdf API");
-        }
-      } else {
-        console.error("Error from merge_pdfs API");
+      if (!mergeResponse.ok) {
+        console.error("Merge API failed with status:", mergeResponse.status);
+        throw new Error("Merge API request failed");
       }
+
+      const mergedPdfBlob = await mergeResponse.blob();
+      console.log("Merged PDF blob received:", mergedPdfBlob);
+
+      const rewriteFormData = new FormData();
+      rewriteFormData.append("pdf_file", mergedPdfBlob, "merged_summary.pdf");
+      rewriteFormData.append("prompt", prompt);
+
+      console.log("Sending rewrite request...");
+      const rewriteResponse = await fetch(
+        "http://13.60.187.155:7865/rewrite_pdf",
+        {
+          method: "POST",
+          body: rewriteFormData,
+        }
+      );
+
+      if (!rewriteResponse.ok) {
+        console.error(
+          "Rewrite API failed with status:",
+          rewriteResponse.status
+        );
+        throw new Error("Rewrite API request failed");
+      }
+
+      const jsonResponse = await rewriteResponse.json();
+      console.log("Raw rewrite response:", jsonResponse);
+
+      // Get the rewritten_pdf field (which should be a string)
+      const rewrittenPdfString = jsonResponse.rewritten_pdf || "";
+      console.log("Raw rewritten_pdf string:", rewrittenPdfString);
+
+      // Clean the string by removing Markdown code fences and other potential issues
+      let cleanedString = rewrittenPdfString
+        .replace(/^```json\s*\n/, "") // Remove opening ```json
+        .replace(/\n```$/, "") // Remove closing ```
+        .replace(/\*\*/g, "") // Remove Markdown bold markers (**)
+        .trim(); // Remove leading/trailing whitespace
+      console.log("Cleaned string:", cleanedString);
+
+      // Check if the cleaned string is empty or still invalid
+      if (!cleanedString) {
+        console.error("Cleaned string is empty");
+        throw new Error("No valid rewritten PDF data received");
+      }
+
+      // Attempt to parse as JSON
+      let parsedJson;
+      try {
+        parsedJson = JSON.parse(cleanedString);
+        console.log("Parsed JSON:", parsedJson);
+      } catch (parseError) {
+        console.error("JSON parsing failed. Cleaned string:", cleanedString);
+        console.error("Parse error details:", parseError);
+        throw parseError; // Re-throw to be caught by outer try-catch
+      }
+
+      setRewrittenText(parsedJson);
+
+      // Upload to Firestore
+      const uploadId = uuidv4();
+      const fileUrls = [];
+      for (const file of selectedFiles) {
+        const storageRef = ref(
+          storage,
+          `uploads/${uploadId}/${file.name}/${selectedButton}`
+        );
+        const uploadResult = await uploadBytes(storageRef, file);
+        const downloadUrl = await getDownloadURL(uploadResult.ref);
+        fileUrls.push({ url: downloadUrl, fileName: file.name });
+      }
+
+      const mrn = generateMRN();
+      const docRef = doc(db, `uploads/${uploadId}`);
+      await setDoc(docRef, {
+        email: user.email,
+        summaryType: selectedButton,
+        uploadedAt: new Date(),
+        rewrittenText: parsedJson,
+        fileUrls,
+        mrn,
+      });
+
+      console.log("Data successfully saved to Firestore with ID:", uploadId);
     } catch (error) {
       console.error("Error occurred while sending request:", error);
+      console.error("Error stack:", error.stack);
     } finally {
       setUploading(false);
       setLoadingDiv(false);
@@ -724,9 +744,9 @@ const Chat = ({ isSidebarOpen }) => {
             </div>
             <button
               onClick={() => handleDownloadPdf(rewrittenText)} // Wrap inside an anonymous function
-              className="absolute top-0 right-0 bg-[#015BA3] text-white px-4 py-2 rounded-md"
+              className="absolute top-0 right-0  bg-[#015BA3] text-white px-4 py-2 rounded-md"
             >
-              <AiOutlineDownload className="mr-2" />
+              <AiOutlineDownload size={16} />
               {/* Download PDF */}
             </button>
           </div>
@@ -768,34 +788,6 @@ const Chat = ({ isSidebarOpen }) => {
             </button>
           </div>
 
-          {/* <div className="grid grid-cols-2 gap-2 font-semibold text-sm sm:text-[1rem]  ">
-            {['Patient History', 'Differential Diagnosis'].map((text, index) => {
-              const isDifferentialDiagnosis = text === 'Differential Diagnosis';
-
-              return (
-                <Tooltip
-                  key={index}
-                  title={isDifferentialDiagnosis ? 'Coming Soon' : ''} // Tooltip only for "Differential Diagnosis"
-                  placement="top"
-                >
-                  <button
-                    key={index}
-                    onClick={() => !isDifferentialDiagnosis && handleButtonClick(text)} // Disable onClick for Differential Diagnosis
-                    disabled={isDifferentialDiagnosis} // Disable the button
-                    className={`sm:p-2  p-1 border rounded-md    ${selectedButton === text
-                      ? 'bg-[#015BA3] text-white border-[#015BA3]'  // Active state
-                      : isDifferentialDiagnosis
-                        ? 'bg-gray-400 text-gray-200 border-gray-400 cursor-not-allowed'  // Disabled state for Differential Diagnosis
-                        : 'bg-white text-[#015BA3] border-[#015BA3]'
-                      }`}
-                    style={{ cursor: isDifferentialDiagnosis ? 'not-allowed' : 'pointer' }} // Change cursor to not-allowed for disabled button
-                  >
-                    {text}
-                  </button>
-                </Tooltip>
-              );
-            })}
-          </div> */}
           <p className="text-gray-500 text-sm mt-2 text-center ">
             <button onClick={toggleModal} className="text-blue-500 underline">
               Disclaimer
